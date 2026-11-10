@@ -21,6 +21,9 @@ struct Args {
     /// GPS serial port path (e.g., /dev/ttyUSB0)
     #[arg(long, default_value = "/dev/ttyUSB0")]
     gps_port: PathBuf,
+    /// GPS serial baud rate
+    #[arg(long,default_value_t = 115_200)]
+    gps_baud: u32,
     /// Arduino serial port path (e.g., /dev/ttyACM0)
     #[arg(long, default_value = "/dev/ttyACM0")]
     arduino_port: PathBuf,
@@ -43,7 +46,7 @@ fn main() -> std::io::Result<()> {
     };
 
     let logger = logging::Logger::new(log_file)?;
-    let mut gps_port = gps_serial::open_port(args.gps_port);
+    let mut gps_port = gps_serial::open_port(args.gps_port, args.gps_baud);
     let mut arduino_port = usb_serial::open_port(args.arduino_port);
 
     let gps_connected = gps_port.is_ok();

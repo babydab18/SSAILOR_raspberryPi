@@ -10,10 +10,9 @@ pub struct SerialReader {
     gps_buffer: String,
 }
 
-pub fn open_port(port: PathBuf) -> Result<SerialReader, Error> {
-    const BAUD_RATE: u32 = 115_200;
+pub fn open_port(port: PathBuf, baud_rate: u32) -> Result<SerialReader, Error> {
 
-    match serialport::new(port.to_string_lossy(), BAUD_RATE)
+    match serialport::new(port.to_string_lossy(), baud_rate)
         .timeout(std::time::Duration::from_millis(10))
         .open_native()
     {
