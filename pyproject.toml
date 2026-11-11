@@ -1,16 +1,16 @@
 [project]
-name = "maarco"
+name = "ssailor-gps-tools"
 version = "0.1.0"
-description = "Code for MAARCO"
+description = "GPS diagnostics, plotting, and optional desktop GPS UI for SSAILOR"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
-    "pygpsclient>=1.5.14",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+    "pyserial>=3.5",
     "pynmeagps>=1.0.53",
     "pyrtcm>=1.1.9",
-    "rpi-hardware-pwm>=0.3.0",
-    "textual>=6.3.0",
-    "textual-dev>=1.8.0",
-    "textual-speedups>=0.2.0",
-    "pyserial>=3.5",
 ]
+
+[project.optional-dependencies]
+desktop = ["pygpsclient>=1.5.14"]

@@ -1,146 +1,124 @@
-// src/main.rs
 use clap::Parser;
-use crossterm::execute;
-use std::io::{Write, stdout};
+use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::{self};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 mod display;
 mod gps;
 mod gps_serial;
 mod logging;
 mod ntrip;
-mod usb_serial;
+mod rtcm;
 
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[derive(Parser)]
+#[command(version, about = "SSAILOR GPS/RTK terminal display and recorder")]
 struct Args {
-    /// NTRIP mountpoint (e.g., MOUNTPOINT)
-    #[arg(long)]
-    ntrip_mount: Option<String>, // E.g. "VMAX-LAND-1"
-    /// GPS serial port path (e.g., /dev/ttyUSB0)
+    /// GPS serial device, e.g. /dev/ttyUSB0 on a Pi or COM3 on Windows
     #[arg(long, default_value = "/dev/ttyUSB0")]
     gps_port: PathBuf,
-    /// GPS serial baud rate
-    #[arg(long,default_value_t = 115_200)]
+    #[arg(long, default_value_t = 115_200, value_parser = clap::value_parser!(u32).range(1..))]
     gps_baud: u32,
-    /// Arduino serial port path (e.g., /dev/ttyACM0)
-    #[arg(long, default_value = "/dev/ttyACM0")]
-    arduino_port: PathBuf,
-    /// Log file path (default: logs/YYYY-MM-DD_HH-MM-SS.csv)
+    /// Enable rover corrections from this NTRIP mountpoint
+    #[arg(long)]
+    ntrip_mount: Option<String>,
+    #[arg(long, default_value = "rtk2go.com")]
+    ntrip_host: String,
+    #[arg(long, default_value_t = 2101, value_parser = clap::value_parser!(u16).range(1..))]
+    ntrip_port: u16,
+    /// Caster username; alternatively set NTRIP_USER. Password comes from NTRIP_PASSWORD.
+    #[arg(long)]
+    ntrip_user: Option<String>,
+    /// Log basename; produces NAME_gps.csv and NAME_rtcm.csv
     #[arg(long)]
     log_file: Option<PathBuf>,
+    /// Stop cleanly after this many seconds, including flushing the last GPS epoch
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    duration: Option<u64>,
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> io::Result<()> {
     let args = Args::parse();
-
-    let log_file = match args.log_file {
-        Some(path) => path,
-        None => {
-            std::fs::create_dir_all("logs")?;
-            let now = chrono::Local::now();
-            let filename = format!("{}", now.format("%Y-%m-%d_%H-%M-%S.csv"));
-            PathBuf::from("logs").join(filename)
-        }
+    let config = args.ntrip_mount.map(|mountpoint| ntrip::Config {
+        host: args.ntrip_host,
+        port: args.ntrip_port,
+        mountpoint,
+        username: args
+            .ntrip_user
+            .or_else(|| std::env::var("NTRIP_USER").ok())
+            .unwrap_or_default(),
+        password: std::env::var("NTRIP_PASSWORD").unwrap_or_default(),
+    });
+    if let Some(config) = &config {
+        config.validate()?;
+    }
+    let mut port = gps_serial::open_port(args.gps_port, args.gps_baud)
+        .map_err(|error| io::Error::other(format!("Cannot open GPS port: {error}")))?;
+    let log_file = args.log_file.unwrap_or_else(|| {
+        PathBuf::from("logs").join(
+            chrono::Local::now()
+                .format("%Y-%m-%d_%H-%M-%S.csv")
+                .to_string(),
+        )
+    });
+    let mut logger = logging::Logger::new(&log_file)?;
+    let (tx, rx) = mpsc::sync_channel(64);
+    let mut status = if let Some(config) = config {
+        std::thread::spawn(move || ntrip::run(config, tx));
+        "Connecting to correction service".to_string()
+    } else {
+        drop(tx);
+        "Disabled (no --ntrip-mount)".to_string()
     };
-
-    let logger = logging::Logger::new(log_file)?;
-    let mut gps_port = gps_serial::open_port(args.gps_port, args.gps_baud);
-    let mut arduino_port = usb_serial::open_port(args.arduino_port);
-
-    let gps_connected = gps_port.is_ok();
-    let arduino_connected = arduino_port.is_ok();
-
-    if !gps_connected && !arduino_connected {
-        eprintln!("No serial ports connected. Exiting.");
-        return Ok(());
-    }
-
     let mut parser = gps::parser::build_parser();
-    let mut gga_fix_quality: Option<String> = None;
-    let mut stdout = stdout();
+    let mut quality = None;
     let mut display = display::Display::new();
-
-    // Initialize terminal
-    execute!(stdout, crossterm::cursor::SetCursorStyle::BlinkingBlock)?;
-
-    // Channel for NTRIP data to write to serial
-    let (tx, rx) = mpsc::channel::<ntrip::NTRIPMessage>();
-
-    // Start NTRIP thread if configured
-    if let Some(mount) = args.ntrip_mount {
-        std::thread::spawn(move || {
-            ntrip::connect_rtk2go_ntrip(tx, &mount);
-        });
-        println!("Started NTRIP thread");
-    }
-
-    // NTRIP status string. This gets updated when we receive messages from the NTRIP thread.
-    let mut ntrip_status: String = String::from("No connection");
+    let mut stdout = io::stdout();
+    display.update(&mut stdout, &parser, quality.as_deref(), &status)?;
+    let started = Instant::now();
+    let mut last_render = Instant::now();
 
     loop {
-        // Read from GPS serial port, if connected
-        if gps_connected {
-            let gps_serial_data = gps_port.as_mut().unwrap().read_sentences();
-            if gps_serial_data.is_err() {
+        if args
+            .duration
+            .is_some_and(|seconds| started.elapsed() >= Duration::from_secs(seconds))
+        {
+            break;
+        }
+        for sentence in port.read_sentences()? {
+            let mut next = parser.clone();
+            if !gps::parser::parse_nmea_sentence(&mut next, &sentence) {
                 continue;
             }
-            let sentences = gps_serial_data.unwrap();
-            for sentence in &sentences {
-                let mut next_parser = parser.clone();
-                gps::parser::parse_nmea_sentence(&mut next_parser, sentence);
-
-                let mut next_gga_fix_quality = gga_fix_quality.clone();
-                if sentence.contains("GGA") {
-                    // Manually parse GGA fix quality
-                    // $GPGGA,time,lat,NS,lon,EW,quality,num_sats,hdop,alt,M,sep,M,diff_age,diff_station*cs
-                    let parts: Vec<&str> = sentence.split(',').collect();
-                    if parts.len() > 6 {
-                        next_gga_fix_quality = Some(parts[6].to_string());
-                    }
-                }
-
-                // If the time has changed, it means we've started a new epoch.
-                // We should log the *previous* epoch's fully accumulated data.
-                if next_parser.fix_time != parser.fix_time
-                    && parser.fix_time.is_some() {
-                        logger.log_nmea(parser.clone(), gga_fix_quality.clone());
-                        display.update_gps(
-                            &mut stdout,
-                            &parser,
-                            gga_fix_quality.clone(),
-                            &ntrip_status,
-                        )?;
-                    }
-
-                parser = next_parser;
-                gga_fix_quality = next_gga_fix_quality;
+            if next.fix_time != parser.fix_time && parser.fix_time.is_some() {
+                logger.log_nmea(parser.clone(), quality.clone())?;
             }
-
-            // Write any pending NTRIP correction data to serial
-            while let Ok(msg) = rx.try_recv() {
-                ntrip_status = msg.to_string();
-                if let ntrip::NTRIPMessage::Rtcm(data) = msg {
-                    logger.log_rtcm(&data);
-                    gps_port.as_mut().unwrap().write_all(&data)?;
-                    gps_port.as_mut().unwrap().flush()?;
+            let mut fields = sentence.trim().split(',');
+            if fields.next().is_some_and(|id| id.ends_with("GGA")) {
+                quality = sentence.split(',').nth(6).map(str::to_string);
+            }
+            parser = next;
+        }
+        // Bound work per iteration so GPS reads remain responsive during corrections.
+        for message in rx.try_iter().take(64) {
+            match message {
+                ntrip::Message::Status(message) => status = message,
+                ntrip::Message::Rtcm(frame) => {
+                    port.write_all(&frame)?;
+                    port.flush()?;
+                    logger.log_rtcm(&frame)?;
+                    status = "Receiving RTCM corrections".to_string();
                 }
             }
         }
-
-        // Read from Arduino serial port, if connected
-        if arduino_connected {
-            let arduino_serial_data = arduino_port.as_mut().unwrap().read_data();
-            if arduino_serial_data.is_err() {
-                // println!("Error reading from Arduino serial port");
-                continue;
-            }
-            if let Some(sensor_data) = arduino_serial_data.unwrap() {
-                // println!("Received sensor data: {:?}", sensor_data);
-                logger.log_sensor_data(&sensor_data);
-                display.update_arduino(&mut stdout, &sensor_data)?;
-            }
-        };
+        if last_render.elapsed() >= Duration::from_secs(1) {
+            display.update(&mut stdout, &parser, quality.as_deref(), &status)?;
+            last_render = Instant::now();
+        }
     }
+    if parser.fix_time.is_some() {
+        logger.log_nmea(parser.clone(), quality.clone())?;
+    }
+    display.update(&mut stdout, &parser, quality.as_deref(), &status)?;
+    Ok(())
 }

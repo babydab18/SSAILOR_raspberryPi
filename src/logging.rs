@@ -1,27 +1,10 @@
-// src/logging.rs
-use crate::usb_serial::SensorData;
 use csv::Writer;
 use nmea::Nmea;
 use serde::Serialize;
-use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
+use std::fs::File;
+use std::io;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-#[derive(Debug, Clone, Serialize)]
-pub struct RtcmData {
-    pub timestamp_ns: u64,
-    message_type: Option<u16>,
-    data_length: usize,
-    data_hex: String, // Hex representation of RTCM data
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub enum LoggerPackets {
-    NmeaSentence(Box<Nmea>, Option<String>),
-    RtcmData(RtcmData),
-    SensorData(SensorData),
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GpsLogData {
@@ -93,162 +76,109 @@ impl GpsLogData {
     }
 }
 
-/// Logger handle that can be cloned and sent to other threads
-#[derive(Clone)]
+#[derive(Serialize)]
+struct RtcmData {
+    timestamp_ns: u64,
+    message_type: u16,
+    data_length: usize,
+    data_hex: String,
+}
+
 pub struct Logger {
-    tx: Sender<LoggerPackets>,
+    gps: Writer<File>,
+    rtcm: Writer<File>,
 }
 
 impl Logger {
-    /// Create a new logger that writes to the specified file
-    pub fn new(log_file_path: PathBuf) -> std::io::Result<Self> {
-        let (tx, rx) = mpsc::channel::<LoggerPackets>();
-
-        // Spawn logging thread
-        thread::spawn(move || {
-            if let Err(e) = run_logger(rx, log_file_path) {
-                eprintln!("Logger error: {}", e);
-            }
-        });
-
-        Ok(Logger { tx })
+    /// Open synchronously: permission/path errors must reach the caller.
+    /// Refuse overwrites so repeated test names cannot destroy earlier logs.
+    pub fn new(base: &Path) -> io::Result<Self> {
+        let parent = base
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let stem = base.file_stem().unwrap_or_default().to_string_lossy();
+        let gps_path = parent.join(format!("{stem}_gps.csv"));
+        let rtcm_path = parent.join(format!("{stem}_rtcm.csv"));
+        // Check both names before creating either file.
+        if gps_path.exists() || rtcm_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Log basename already exists; choose another --log-file",
+            ));
+        }
+        let gps = Writer::from_writer(
+            File::options()
+                .write(true)
+                .create_new(true)
+                .open(gps_path)?,
+        );
+        let rtcm = Writer::from_writer(
+            File::options()
+                .write(true)
+                .create_new(true)
+                .open(rtcm_path)?,
+        );
+        Ok(Self { gps, rtcm })
     }
 
-    /// Log a NMEA sentence
-    pub fn log_nmea(&self, parser: Nmea, gga_fix_quality: Option<String>) {
-        let _ = self
-            .tx
-            .send(LoggerPackets::NmeaSentence(Box::new(parser), gga_fix_quality));
+    pub fn log_nmea(&mut self, nmea: Nmea, quality: Option<String>) -> io::Result<()> {
+        self.gps
+            .serialize(GpsLogData::from_nmea(nmea, quality, timestamp_ns()))?;
+        self.gps.flush()
     }
 
-    /// Log RTCM correction data
-    pub fn log_rtcm(&self, data: &[u8]) {
-        let message_type = extract_rtcm_message_type(data);
-        let data_hex = hex_encode(data);
-        let timestamp_ns = get_timestamp_nanos();
-        let data = RtcmData {
-            timestamp_ns,
+    pub fn log_rtcm(&mut self, frame: &[u8]) -> io::Result<()> {
+        let message_type = crate::rtcm::message_type(frame).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Not a complete valid RTCM frame",
+            )
+        })?;
+        self.rtcm.serialize(RtcmData {
+            timestamp_ns: timestamp_ns(),
             message_type,
-            data_length: data.len(),
-            data_hex,
-        };
-        let _ = self.tx.send(LoggerPackets::RtcmData(data));
-    }
-
-    pub fn log_sensor_data(&self, data: &SensorData) {
-        let _ = self.tx.send(LoggerPackets::SensorData(data.clone()));
+            data_length: frame.len(),
+            data_hex: frame.iter().map(|byte| format!("{byte:02x}")).collect(),
+        })?;
+        self.rtcm.flush()
     }
 }
 
-/// Main logging thread function
-fn run_logger(rx: Receiver<LoggerPackets>, log_file_path: PathBuf) -> std::io::Result<()> {
-    // Create writers for different data types
-    let file_stem = log_file_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let extension = log_file_path
-        .extension()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let parent = log_file_path.parent().unwrap_or(std::path::Path::new("."));
-
-    let make_path = |suffix: &str| -> PathBuf {
-        let mut name = file_stem.to_string();
-        name.push_str(suffix);
-        if !extension.is_empty() {
-            name.push('.');
-            name.push_str(&extension);
-        }
-        parent.join(name)
-    };
-
-    let gps_path = make_path("_gps");
-    let rtcm_path = make_path("_rtcm");
-    let sensor_path = make_path("_sensor");
-
-    let mut gps_writer = Writer::from_path(gps_path)?;
-    let mut rtcm_writer = Writer::from_path(rtcm_path)?;
-    let mut sensor_writer = Writer::from_path(sensor_path)?;
-
-    loop {
-        match rx.recv() {
-            Ok(packet) => match packet {
-                LoggerPackets::NmeaSentence(data, gga_fix_quality) => {
-                    let timestamp_ns = get_timestamp_nanos();
-                    let gps_data = GpsLogData::from_nmea(*data, gga_fix_quality, timestamp_ns);
-                    gps_writer.serialize(gps_data)?;
-                    gps_writer.flush()?;
-                }
-                LoggerPackets::RtcmData(data) => {
-                    rtcm_writer.serialize(data)?;
-                    rtcm_writer.flush()?;
-                }
-                LoggerPackets::SensorData(data) => {
-                    sensor_writer.serialize(data)?;
-                    sensor_writer.flush()?;
-                }
-            },
-            Err(err) => {
-                // Channel closed, exit logging thread
-                eprintln!("Logging thread error: {}", err);
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Get current timestamp in nanoseconds since UNIX epoch
-fn get_timestamp_nanos() -> u64 {
+fn timestamp_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
+        .unwrap_or_default()
         .as_nanos() as u64
-}
-
-/// Extract RTCM message type from data
-/// RTCM v3 format: first 12 bits after preamble contain message type
-fn extract_rtcm_message_type(data: &[u8]) -> Option<u16> {
-    if data.len() < 3 {
-        return None;
-    }
-
-    // RTCM v3 starts with 0xD3 preamble
-    if data[0] != 0xD3 {
-        return None;
-    }
-
-    // Message type is in bits 12-23 of the header
-    // Byte 1 bits 0-5 and byte 2 bits 0-5 contain the message type
-    let msg_type = ((data[1] as u16 & 0x3F) << 6) | ((data[2] as u16) >> 2);
-    Some(msg_type)
-}
-
-/// Convert bytes to hex string
-fn hex_encode(data: &[u8]) -> String {
-    data.iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn test_rtcm_message_type_extraction() {
-        // RTCM message 1005 example
-        let data = vec![0xD3, 0x00, 0x13, 0x3E, 0xD0]; // Simplified
-        let msg_type = extract_rtcm_message_type(&data);
-        assert!(msg_type.is_some());
-    }
-
-    #[test]
-    fn test_hex_encode() {
-        let data = vec![0xD3, 0x00, 0x13];
-        assert_eq!(hex_encode(&data), "d30013");
+    fn creates_nested_logs_and_keeps_existing_recordings() {
+        let root = std::env::temp_dir().join(format!(
+            "ssailor-logger-{}-{}",
+            std::process::id(),
+            timestamp_ns()
+        ));
+        let base = root.join("nested/test.csv");
+        let mut logger = Logger::new(&base).unwrap();
+        let mut gps = Nmea::default();
+        gps.latitude = Some(35.0);
+        gps.altitude = Some(123.5);
+        logger.log_nmea(gps, Some("4".into())).unwrap();
+        logger.log_rtcm(&crate::rtcm::tests::FRAME_1005).unwrap();
+        drop(logger);
+        let csv = std::fs::read_to_string(root.join("nested/test_gps.csv")).unwrap();
+        assert!(csv.contains("altitude_m"));
+        assert!(csv.contains("Fixed"));
+        assert!(csv.contains("123.5"));
+        let rtcm = std::fs::read_to_string(root.join("nested/test_rtcm.csv")).unwrap();
+        assert!(rtcm.contains(",1005,25,"));
+        assert!(Logger::new(&base).is_err());
+        assert!(!root.join("nested/test_sensor.csv").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,120 +1,136 @@
-# SSAILOR_raspberryPi
-GpS/Raspberry PI code
+# SSAILOR GPS / RTK
 
-# MAARCO
+GPS terminal UI, rover correction forwarding, and recordings for SSAILOR.
+Derived from [EMSSL-Lab/MAARCO](https://github.com/EMSSL-Lab/MAARCO);
+the original MIT license and attribution are retained in `LICENSE`.
 
-This is the code for the MAARCO project. It involves reading GPS RTK data from a serial port, displaying it in a terminal UI, and optionally connecting to an NTRIP server for real-time corrections.
+## What this application does
 
-We are using a Raspberry Pi 4B as the main hardware platform.
+- Opens a GPS receiver and parses its NMEA position messages.
+- Shows coordinates, satellite count, fix quality (including Fixed/Float RTK),
+  dilution of precision, signal information, and correction connection status.
+- Optionally receives RTCM3 corrections from an NTRIP caster and forwards complete,
+  CRC-validated frames to a rover receiver.
+- Writes GPS and correction CSVs. It no longer opens or logs an Arduino port.
+- Supplies GPS plotting, raw byte capture, and a localhost serial bridge for a
+  desktop GPS application such as PyGPSClient.
 
-All data is also logged to a file. The file is a CSV, which you can find under `logs/`.
+**The receiver computes the RTK solution.** This program does not compute it.
+The LC29H(BS) is a base receiver and normally emits binary corrections, not the
+rover NMEA positions this terminal UI expects. A waiting screen with a BS attached
+is not proof that the receiver is broken. Use raw capture or a compatible desktop
+GNSS tool to inspect it. This repository does not yet configure survey-in, establish
+a base reference position, or publish a base correction stream to an NTRIP caster.
 
-## Project structure
+## Build on the Pi
 
-- `src/`: Contains the Rust source code for the project.
-- `examples/`: Contains example Python scripts for decoding log files and streaming NMEA data. Also includes some Rust code.
-- `logs/`: Directory where CSV log files are stored.
-- `field_tests/`: This is where the data from field tests is stored. The data can be decoded using the scripts in `examples/plot_gps_log.py`.
-
-## Support
-
-This guide is written assuming that you are running Linux, or at least [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) (you should get the Ubuntu distribution). 
-
-## How to ssh into the Pi:
-
-First, you should be familiar with `ssh`. See [this guide](https://www.geeksforgeeks.org/linux-unix/ssh-command-in-linux-with-examples/) for a short introduction. Next, you need to make a WiFi hotspot so the Raspberry Pi can connect to it. The Wifi name should be `Witcher`, and the password should be `harshil1234`. Now switch on this WiFi hotspot, and make sure your computer and/or your phone is also connected to it. You should shortly see the IP address of the raspberry pi on the list of connected devices.
-
-So to ssh into the Pi, you would do:
-
-```bash
-ssh pi4b@<IP ADDRESS>
-```
-It will ask you for the password. Enter `emssl_lab`.
-
-## How to run on your computer
-
-Since this project uses both Rust and Python, ensure you have both installed. For python, you need to install [`uv`](https://docs.astral.sh/uv/getting-started/installation/) to manage dependencies.
-
-To install Rust, follow the instructions at [rustup.rs](https://rustup.rs/).
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/harshil21/MAARCO.git && cd MAARCO
-   ```
-
-2. Install Python dependencies (this is for the post-processing scripts):
-   ```bash
-   uv sync
-   ```
-
-3. Build the Rust project:
-   ```bash
-   cargo build --release
-   ``` 
-
-## How to run on the Pi:
-
-We want to compile this project and execute that on the Raspberry Pi. So we will actually compile the code on our computer, and then make the Pi use that binary, because compiling directly on the Raspberry Pi can be *very* slow.
-
-So now let's set up a cross-compilation environment on our computer.
-
-You can cross compile via `cargo`:
-
-1. First, install the ARM target. This is the CPU architecture the Raspberry Pi uses:
-    ```bash
-    rustup target add aarch64-unknown-linux-gnu
-    ```
-   
-2. Next, install the necessary linker (i.e. `gcc`). For Ubuntu based distributions, you can do this via:
-    ```bash
-    sudo apt-get install build-essential gcc-aarch64-linux-gnu
-    ```
-3. Now, you can build the project for the Raspberry Pi:
-    ```bash
-    cargo build --target aarch64-unknown-linux-gnu --release
-    ```
-4. You should now have a binary located at `target/aarch64-unknown-linux-gnu/release/maarco`. You should copy this binary to the Raspberry Pi, e.g. via
-`scp`:
-   ```bash
-   scp target/aarch64-unknown-linux-gnu/release/maarco pi4b@<RASPBERRY_PI_IP_ADDRESS>:~/
-   ```
-
-5. Finally, run the application on the Raspberry Pi:
-    ```bash
-    ./maarco --ntrip-mount MOUNTPOINT --log-file logs/test_1.csv
-    ```
-
-Replace `MOUNTPOINT` with your actual NTRIP mount point
-(the list of all NTRIP mount points can be found [here](http://rtk2go.com:2101/SNIP::STATUS)).
-
-You should typically use the `VMAX-LAND-1` mount point. This is located in [Baybrook, NC](http://rtk2go.com:2101/SNIP::BASEandUSERMAP?baseName=VMAX-LAND-1&tk=nFghcsAw9xJ3rpf6qwPE) and is good for testing if you are within 10 miles of that location.
-
-For locations further away, you should choose a mount point closer to your location, otherwise the RTK corrections will not be effective. You can browse the list of mount points in the link above to find one near you. If there are none, you should
-set up your own RTK base station (see [Base station setup](#base-station-setup) below).
-
-If you don't have one, you can omit the `--ntrip-mount` argument, and the application will run
-without NTRIP support (so you will not get RTK corrections).
-
-### Running without the Pi:
-
-You can also run the application on your computer if you have a GPS device connected via USB or serial port. Just make sure to specify the correct serial port as a command line argument (`--gps-port`) (currently set to `/dev/ttyUSB0`). 
-
-The list of all command line arguments can be checked by running `./maarco --help`.
-
-## Post processing the gps data:
-
-You can run the example Python scripts to post process the GPS data. For example, to plot the 2D, and 3D deviation map from the GPS run:
+The existing Pi already has Rust. Build in the directory containing this README:
 
 ```bash
-uv run --script examples/plot_gps_log.py field_tests/volleyball/12_5_25/perimeter_long_rtk_fixed_gps.csv
+source "$HOME/.cargo/env"
+cargo build --release --locked
+./target/release/maarco --help
 ```
 
-Or to run a Rust example:
+For a fresh Pi, install Git, curl, build-essential, and pkg-config, then install
+Rust using https://rustup.rs. The crate uses Rust edition 2024; use a current stable
+toolchain compatible with `Cargo.lock`. Python is optional for the Rust application.
+
+## GPS display and recording
+
+Stop other programs using the same GPS serial port first.
 
 ```bash
-cargo run --example file_name[no .rs]
+./target/release/maarco --gps-port /dev/ttyUSB0 --gps-baud 115200 --duration 30
 ```
 
-## Base station setup
+Omit `--duration` for continuous operation; Ctrl+C stops it. A timed run flushes
+the final accumulated GPS epoch. During normal operation each completed epoch and
+each correction frame is flushed as it is recorded. Abrupt termination can omit
+the final in-progress epoch.
 
-TODO!
+Logs default to `logs/TIMESTAMP_gps.csv` and `logs/TIMESTAMP_rtcm.csv`.
+`--log-file logs/test.csv` produces `test_gps.csv` and `test_rtcm.csv`.
+Existing log names are rejected rather than overwritten. No `_sensor.csv` is created.
+GPS altitude is in `altitude_m`; speed is recorded/displayed in knots.
+Missing values display as N/A, and displayed position values are the last received
+values, not a guarantee of a fresh fix. No NMEA positions means no GPS rows.
+
+## Rover corrections through NTRIP
+
+Choose a compatible nearby base/mountpoint. The following values are placeholders;
+use the caster credentials assigned to you. They are separate from GitHub credentials.
+
+```bash
+export NTRIP_USER='YOUR_CASTER_USERNAME'
+read -rs -p 'NTRIP password: ' NTRIP_PASSWORD; echo
+export NTRIP_PASSWORD
+./target/release/maarco --gps-port /dev/ttyUSB0 --gps-baud 115200 \
+  --ntrip-host YOUR_CASTER_HOST --ntrip-port 2101 --ntrip-mount YOUR_MOUNTPOINT
+unset NTRIP_PASSWORD
+```
+
+`--ntrip-user` can replace `NTRIP_USER`. The password is read only from the
+environment. Without `--ntrip-mount`, no correction connection is started.
+The client retries failed/closed connections after five seconds and shows the
+status even without GPS positions. It supports plain TCP NTRIP v1 / HTTP identity
+responses; TLS, chunked transfer encoding, and sending rover GGA to VRS services
+are not implemented. Use a compatible fixed-base stream. Plain TCP does not encrypt
+caster credentials; use a trusted connection or an appropriate tunnel.
+
+## Optional Python GPS tools
+
+Python 3.11+ is supported. Install uv using https://docs.astral.sh/uv/, then:
+
+```bash
+uv sync --locked
+uv run python examples/plot_gps_log.py logs/YOUR_RUN_gps.csv
+uv run python examples/plot_gps_log.py logs/YOUR_RUN_gps.csv --kml exports/track.kml --no-show
+uv run python tools/capture_serial.py --port /dev/ttyUSB0 --seconds 10 --output logs/base-sample.bin
+```
+
+The plotting script accepts both current `altitude_m` and historical `altitude`
+columns. Plot windows require a graphical session; `--no-show` KML export, capture, and the bridge work over SSH.
+Capture preserves all bytes, including RTCM and proprietary status text. Use a new
+output filename for each recording.
+
+For the optional desktop UI, `uv sync --locked --extra desktop`, then
+`uv run --extra desktop pygpsclient`. On Raspberry Pi OS, the desktop UI may also
+need the OS Tk package (`python3-tk`) and a graphical session.
+
+## View the Pi's receiver from a laptop
+
+1. On the Pi, stop MAARCO/capture/other GPS readers and run:
+   `uv run python tools/serial_bridge.py --port /dev/ttyUSB0 --baud 115200`.
+2. On the laptop, open an SSH tunnel and leave it running:
+   `ssh -N -L 12345:127.0.0.1:12345 ssailor@PI_IP`.
+3. Open PyGPSClient on the laptop and select a TCP socket connection to
+   `127.0.0.1`, port `12345`.
+
+The bridge binds only to Pi localhost, supports one client at a time, and transports
+raw bytes in both directions. It does not store SSH passwords or configure the receiver.
+While the bridge is running, do not start another program on the same serial device.
+
+## Project layout
+
+- `src/`: GPS-only Rust runtime, terminal UI, NTRIP, RTCM framing, and CSV logging.
+- `examples/plot_gps_log.py`: GPS CSV plots and KML export.
+- `tools/`: raw capture and SSH-tunnel-compatible serial bridge.
+- `tests/`: Python regression tests; Rust tests live beside the code.
+- `docs/PI_TRANSFER.md`: laptop-to-Pi copy and build instructions.
+- `scripts/package_pi.py`: makes the source-only transfer archive.
+- `archive/`: retired motor/Arduino examples, old experiments, and historical data.
+  These are not compiled or included in the Pi transfer package.
+
+## Validation
+
+```bash
+cargo test --locked --all-targets
+uv run --locked python -m unittest discover -s tests -v
+python scripts/package_pi.py
+```
+
+Tests cover a real captured RTCM frame, fragmentation/coalescing, bad checksums,
+NTRIP headers/EOF with a local mock caster, GPS waiting display, log output,
+altitude compatibility, recording preservation, and binary serial bridging.
+Real receiver, antenna, and RTK Fixed validation must still be done on the Pi outdoors.

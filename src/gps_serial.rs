@@ -1,20 +1,19 @@
 use serialport::Error;
-use serialport::TTYPort;
+use serialport::SerialPort;
 use std::io::Read;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Debug)]
 pub struct SerialReader {
-    gps_port: TTYPort,
+    gps_port: Box<dyn SerialPort>,
     gps_buffer: String,
 }
 
 pub fn open_port(port: PathBuf, baud_rate: u32) -> Result<SerialReader, Error> {
-
     match serialport::new(port.to_string_lossy(), baud_rate)
-        .timeout(std::time::Duration::from_millis(10))
-        .open_native()
+        .timeout(std::time::Duration::from_millis(100))
+        .open()
     {
         Ok(gps_port) => {
             println!("Successfully opened port {}", port.to_string_lossy());
@@ -35,7 +34,7 @@ pub fn open_port(port: PathBuf, baud_rate: u32) -> Result<SerialReader, Error> {
 }
 
 impl SerialReader {
-    pub fn read_sentences(&mut self) -> Result<Vec<String>, Error> {
+    pub fn read_sentences(&mut self) -> io::Result<Vec<String>> {
         let mut serial_buf: Vec<u8> = vec![0; 1024];
         let mut sentences = Vec::new();
 
@@ -43,6 +42,10 @@ impl SerialReader {
             Ok(t) if t > 0 => {
                 let text = String::from_utf8_lossy(&serial_buf[..t]).into_owned();
                 self.gps_buffer.push_str(&text);
+                // Bound incomplete/noisy input, including base-station binary streams.
+                if self.gps_buffer.len() > 16_384 {
+                    self.gps_buffer.clear();
+                }
 
                 loop {
                     if let Some(start) = self.gps_buffer.find('$') {
@@ -73,7 +76,7 @@ impl SerialReader {
             Err(ref e) if e.kind() == io::ErrorKind::TimedOut => Ok(sentences),
             Err(e) => {
                 // eprintln!("Error reading from port: {:?}", e);
-                Err(Error::from(e))
+                Err(e)
             }
         }
     }

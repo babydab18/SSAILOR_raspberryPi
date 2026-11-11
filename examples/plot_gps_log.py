@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.13"
+# requires-python = ">=3.11"
 # dependencies = [
 # "matplotlib",
 # "numpy",
@@ -14,6 +14,7 @@ from matplotlib.lines import Line2D
 from matplotlib.ticker import MultipleLocator
 import csv
 import argparse
+from html import escape
 
 @dataclass
 class ParsedGpsData:
@@ -41,7 +42,7 @@ class CsvGpsParser:
                         timestamp = int(row['timestamp_ns'])
                         lat = float(row['latitude'])
                         long = float(row['longitude'])
-                        alt = float(row.get('altitude', 0.0))
+                        alt = float(row.get('altitude_m') or row.get('altitude') or 0.0)
                         fix_quality = row.get('gga_fix_quality', 'Invalid')
                         
                         self.data.append(ParsedGpsData(timestamp, lat, long, alt, fix_quality))
@@ -179,7 +180,7 @@ class CsvGpsParser:
         kml = '<?xml version="1.0" encoding="UTF-8"?>\n'
         kml += '<kml xmlns="http://www.opengis.net/kml/2.2">\n'
         kml += '<Document>\n'
-        kml += f' <name>{self.file_path.name}</name>\n'
+        kml += f' <name>{escape(self.file_path.name)}</name>\n'
         # Define styles for each fix quality
         unique_qualities = set(d.fix_quality for d in self.data)
         for q in unique_qualities:
@@ -205,7 +206,8 @@ class CsvGpsParser:
             kml += ' </Placemark>\n'
         kml += '</Document>\n'
         kml += '</kml>'
-        with output_path.open('w') as f:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open('w', encoding='utf-8') as f:
             f.write(kml)
         print(f"Exported to {output_path}")
 
@@ -213,13 +215,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Plot GPS log data')
     parser.add_argument('file', type=Path, help='Path to the GPS CSV log file')
     parser.add_argument('--kml', type=Path, help='Path to export KML file for Google Earth', default=None)
+    parser.add_argument('--no-show', action='store_true', help='Skip plot windows (useful for KML export over SSH)')
     args = parser.parse_args()
     if not args.file.exists():
         print(f"File {args.file} does not exist")
         exit(1)
     parser = CsvGpsParser(args.file)
     parser.parse_csv()
-    parser.plot_deviation_map()
-    parser.plot_3d_deviation_map()
+    if not args.no_show:
+        parser.plot_deviation_map()
+        parser.plot_3d_deviation_map()
     if args.kml:
         parser.export_to_kml(args.kml)

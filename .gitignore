@@ -1,8 +1,10 @@
-# Ignore rust build artifacts:
-/target
-
-# Ignore generated log files:
-logs/
-
-# Ignore exported files (e.g. to google earth):
-exports/
+/target/
+/.venv/
+__pycache__/
+*.pyc
+/logs/
+/exports/
+/dist/
+/build-output.txt
+.env
+.env.*
